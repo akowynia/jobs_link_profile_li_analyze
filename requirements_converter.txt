@@ -1,0 +1,2 @@
+# Zależności dla pdf_converter_reportlab.py (łatwiejsza instalacja)
+reportlab>=4.0.0

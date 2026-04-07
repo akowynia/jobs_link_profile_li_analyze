@@ -1,0 +1,10 @@
+beautifulsoup4>=4.12.0
+cloudscraper>=1.2.71
+markdown>=3.6
+ollama>=0.4.0
+pandas>=2.2.0
+py7zr>=0.20.0
+pyunpack>=0.3
+rarfile>=4.2
+streamlit>=1.36.0
+weasyprint>=62.0

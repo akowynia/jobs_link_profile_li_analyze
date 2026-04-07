@@ -1,0 +1,625 @@
+import sqlite3
+import json
+import hashlib
+from datetime import date, datetime
+from pathlib import Path
+import cloudscraper
+import bs4
+import ollama
+from analysis_utils import extract_json_from_text
+
+
+class MainJobAnalyzer:
+    def __init__(self, db_path='discord_bot.db', analysis_db_path='cv_analysis.db', output_file='output.txt', analysis_file=None):
+        self.db_path = db_path  # Baza danych dla ofert pracy
+        self.analysis_db_path = analysis_db_path  # Osobna baza danych dla analiz CV
+        self.output_file = output_file
+        # Tworzenie nazwy pliku z datą z chwili uruchomienia
+        if analysis_file is None:
+            current_date = datetime.now().strftime('%Y-%m-%d')
+            filename = f'analiza_{current_date}.txt'
+            analyses_dir = Path('analyses_txt')
+            analyses_dir.mkdir(parents=True, exist_ok=True)
+            self.analysis_file = analyses_dir / filename
+        else:
+            # jeśli podano ścieżkę lub nazwę pliku, zapisz ją w folderze analyses_txt
+            analyses_dir = Path('analyses_txt')
+            analyses_dir.mkdir(parents=True, exist_ok=True)
+            self.analysis_file = analyses_dir / analysis_file
+        self.conn = None
+        # Inicjalizacja bazy danych dla analiz
+        self.init_analysis_database()
+        # MIEJSCE NA INSTRUKCJE 
+        self.ollama_instruction = """
+        Porównaj poniższe CV z opisem oferty pracy i oceń dopasowanie kandydata.
+        
+        CV:
+        {cv_content}
+        
+        Oferta pracy:
+        {job_description}
+        
+        Przeanalizuj dopasowanie i przedstaw wynik.
+        """
+
+    def process_website(self, website):
+        response = ""
+        try:
+            # Sprawdzenie, czy adres URL zaczyna się od http:// lub https://
+            if not website.startswith(('http://', 'https://')):
+                print(
+                    "Niepoprawny adres URL. Proszę podać adres zaczynający się od http:// lub https://")
+                return
+            if website.startswith('https://czyjesteldorado.pl/'):
+                print("pomijam stronę czyjesteldorado.pl")
+                return 
+            # Pobranie treści strony
+            scraper = cloudscraper.create_scraper()
+            response = scraper.get(website)
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Błąd podczas pobierania strony: {e}")
+            return
+
+        # Parsowanie HTML
+        content = bs4.BeautifulSoup(response.text, features="html.parser")
+
+        # Usuwanie niepotrzebnych elementów
+        for tag in content(['script', 'style', 'nav', 'footer', 'header', 'noscript', 'iframe']):
+            tag.decompose()
+
+        # Wyciągnięcie czystego tekstu
+        text_content = content.get_text(separator=' ', strip=True)
+
+        # Usuwanie nadmiarowych białych znaków
+        text_content = ' '.join(text_content.split())
+
+        return text_content
+
+    def connect_db(self):
+        """Połącz z bazą danych"""
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.row_factory = sqlite3.Row
+        return self.conn.cursor()
+
+    def init_analysis_database(self):
+        """Inicjalizuj tabelę do przechowywania analiz CV"""
+        # Połącz z osobną bazą danych dla analiz
+        conn = sqlite3.connect(self.analysis_db_path)
+        cursor = conn.cursor()
+        
+        # Tworzenie tabeli na wyniki analiz CV
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS CVAnalysisResults (
+                analysis_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_link TEXT NOT NULL,
+                creation_date TEXT NOT NULL,
+                analysis_content TEXT NOT NULL,
+                score INTEGER,
+                cv_content_hash TEXT,
+                strengths TEXT,
+                weaknesses TEXT,
+                matched_skills TEXT,
+                missing_skills TEXT,
+                summary TEXT
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        print(f"Baza danych analiz CV została zainicjalizowana: {self.analysis_db_path}")
+
+    def get_today_offers(self):
+        """Pobierz oferty z dzisiejszą datą"""
+        cursor = self.connect_db()
+        today = date.today().isoformat()
+
+        query = """
+        SELECT * FROM JobsInformation 
+        WHERE date(currentTime) = date(?)
+        ORDER BY currentTime DESC
+        """
+
+        cursor.execute(query, (today,))
+        offers = cursor.fetchall()
+        return offers
+
+    def get_between_dates_offers(self, start_date, end_date):
+        """Pobierz oferty między dwoma datami"""
+        cursor = self.connect_db()
+
+        query = """
+        SELECT * FROM JobsInformation 
+        WHERE date(currentTime) BETWEEN date(?) AND date(?)
+        ORDER BY currentTime DESC
+        """
+
+        cursor.execute(query, (start_date, end_date))
+        offers = cursor.fetchall()
+        return offers
+
+    def read_output_file(self):
+        """Wczytaj zawartość pliku output.txt"""
+        output_path = Path(self.output_file)
+        if output_path.exists():
+            with open(output_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        return None
+
+    def return_job_links(self):
+        """Wyświetl linki ofert pracy z dzisiejszą datą"""
+        offers = self.get_today_offers()
+
+        print(f"\n{'='*60}")
+        print(f"Oferty pracy z dnia: {date.today().strftime('%Y-%m-%d')}")
+        print(f"Liczba ofert: {len(offers)}")
+        print(f"{'='*60}\n")
+
+        if not offers:
+            print("Brak ofert na dzisiejszy dzień.")
+            return []
+        checked_offers = []
+        for offer in offers:
+            if self.check_link_in_database_cv_analysis(offer['linkOffer']):
+                print(f"Oferta {offer['linkOffer']} została już przeanalizowana. Pomijam.")
+            else:
+                checked_offers.append(offer)
+
+        # Jeśli brak nieprzeanalizowanych ofert — zwróć pustą listę
+        if not checked_offers:
+            print("Brak nieprzeanalizowanych ofert do analizy.")
+            return []
+
+        print(f"Liczba nieprzeanalizowanych ofert: {len(checked_offers)}")
+        # Zwróć tylko linki nieprzeanalizowanych ofert
+        link_offers = [offer['linkOffer'] for offer in checked_offers]
+        return link_offers
+
+    def return_job_links_between_dates(self, start_date, end_date):
+        """Wyświetl linki ofert pracy z określonego przedziału czasowego"""
+        offers = self.get_between_dates_offers(start_date, end_date)
+
+        print(f"\n{'='*60}")
+        print(f"Oferty pracy z okresu: {start_date} - {end_date}")
+        print(f"Liczba ofert: {len(offers)}")
+        print(f"{'='*60}\n")
+
+        if not offers:
+            print(f"Brak ofert w okresie {start_date} - {end_date}.")
+            return []
+        checked_offers = []
+        for offer in offers:
+            if self.check_link_in_database_cv_analysis(offer['linkOffer']):
+                print(f"Oferta {offer['linkOffer']} została już przeanalizowana. Pomijam.")
+            else:
+                checked_offers.append(offer)
+
+        # Jeśli brak nieprzeanalizowanych ofert — zwróć pustą listę
+        if not checked_offers:
+            print(f"Brak nieprzeanalizowanych ofert w okresie {start_date} - {end_date}.")
+            return []
+
+        print(f"Liczba nieprzeanalizowanych ofert: {len(checked_offers)}")
+        # Zwróć tylko linki nieprzeanalizowanych ofert
+        link_offers = [offer['linkOffer'] for offer in checked_offers]
+        return link_offers
+
+    def close(self):
+        """Zamknij połączenie z bazą danych"""
+        if self.conn:
+            self.conn.close()
+
+    def process_offers(self, link_offers, cv_content):
+        """Przetwarza listę ofert i analizuje dopasowanie do CV"""
+        for link in link_offers:
+            print(f"\nPrzetwarzam ofertę: {link}")
+
+            # Pobierz treść oferty
+            job_description = self.process_website(link)
+
+            if not job_description:
+                print(f"Nie udało się pobrać treści oferty: {link}")
+                continue
+
+            # Analizuj dopasowanie
+            print("Analizuję dopasowanie...")
+            analysis_result = self.analyze_with_ollama(cv_content, job_description)
+
+            if analysis_result:
+                # Zapisz analizę (przekaż również CV content)
+                self.save_analysis(analysis_result, link, cv_content)
+                print("Analiza ukończona!")
+            else:
+                print("Nie udało się przeprowadzić analizy.")
+
+    def run_between_dates_offers(self, start_date, end_date):
+        """Uruchom analizę dla ofert z określonego przedziału czasowego"""
+        try:
+            # Wczytaj CV z output.txt
+            cv_content = self.read_output_file()
+            if not cv_content:
+                print("Nie znaleziono pliku output.txt z CV!")
+                return
+
+            # Wyświetl linki ofert z przedziału czasowego
+            link_offers = self.return_job_links_between_dates(start_date, end_date)
+
+            if not link_offers:
+                return
+
+            # Przetwórz oferty
+            self.process_offers(link_offers, cv_content)
+
+        except Exception as e:
+            print(f"Błąd: {e}")
+        finally:
+            self.close()
+
+    def analyze_with_ollama(self, cv_content, job_description):
+        """Analizuj dopasowanie CV do oferty za pomocą Ollama"""
+        try:
+            # Przygotowanie promptu z instrukcją
+            prompt = self.ollama_instruction.format(
+                cv_content=cv_content,
+                job_description=job_description
+            )
+
+            # Wywołanie Ollama z modelem ministral-3:8b
+            response = ollama.chat(
+                model='ministral-3:8b',
+                messages=[
+                    {
+                        'role': 'system',
+                        'content': 'Masz za zadanie porównać CV z opisem oferty pracy. Twoja odpowiedź musi być wyłącznie poprawnym obiektem JSON. Struktura: {"score": int, "strengths": ["string"], "weaknesses": ["string"], "key_skills_match": {"matched": ["string"], "missing": ["string"]}, "summary": "string"}. Zasady: Oceń dopasowanie 1-10 (liczba całkowita), skup się na konkretach (technologie, staż, certyfikaty), nie dodawaj żadnego tekstu poza obiektem JSON.'
+                        #'content': 'Masz za zadanie porównać CV z opisem oferty pracy i ocenić dopasowanie kandydata. Odpowiedz w sposób zwięzły, ale konkretny, wskazując mocne i słabe strony kandydata względem wymagań oferty. Oceniaj dopasowanie na skali od 1 do 10, gdzie 1 oznacza brak dopasowania, a 10 oznacza idealne dopasowanie. Uwzględnij kluczowe umiejętności, doświadczenie i kwalifikacje wymienione w CV oraz porównaj je z wymaganiami oferty pracy.'
+                    },
+                    {
+
+                        'role': 'user',
+                        'content': prompt
+                    }
+                ]
+            )
+
+            # Wyciągnięcie odpowiedzi
+            analysis_result = response['message']['content']
+            return analysis_result
+
+        except Exception as e:
+            print(f"Błąd podczas analizy z Ollama: {e}")
+            return None
+
+    def save_analysis(self, content, job_link, cv_content=None):
+        """Zapisz analizę do pliku i bazy danych"""
+        try:
+            # Zapisz do pliku
+            with open(self.analysis_file, 'a', encoding='utf-8') as f:
+                f.write(f"\n{'='*80}\n")
+                f.write(f"Link oferty: {job_link}\n")
+                f.write(
+                    f"Data analizy: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"{'='*80}\n")
+                f.write(content)
+                f.write(f"\n{'='*80}\n\n")
+            print(f"Analiza zapisana do {self.analysis_file}")
+            
+            # Zapisz do bazy danych
+            self.save_analysis_to_db(content, job_link, cv_content)
+            
+        except Exception as e:
+            print(f"Błąd podczas zapisywania analizy: {e}")
+
+    def extract_json_from_text(self, text):
+        """Wyciągnij JSON z tekstu który może zawierać dodatkowy tekst"""
+        return extract_json_from_text(text)
+
+    def save_analysis_to_db(self, analysis_content, job_link, cv_content=None):
+        """Zapisz wynik analizy do bazy danych"""
+        try:
+            # Połącz z osobną bazą danych dla analiz
+            conn = sqlite3.connect(self.analysis_db_path)
+            cursor = conn.cursor()
+            
+            # Parsowanie JSON z analizy
+            score = None
+            strengths = None
+            weaknesses = None
+            matched_skills = None
+            missing_skills = None
+            summary = None
+            
+            try:
+                # Wyciągnij JSON z tekstu
+                json_text = self.extract_json_from_text(analysis_content)
+                print(f"Próbuję sparsować JSON: {json_text[:200]}...")
+                
+                # Próba parsowania JSON
+                analysis_json = json.loads(json_text)
+                score = analysis_json.get('score')
+                strengths = json.dumps(analysis_json.get('strengths', []), ensure_ascii=False)
+                weaknesses = json.dumps(analysis_json.get('weaknesses', []), ensure_ascii=False)
+                
+                key_skills_match = analysis_json.get('key_skills_match', {})
+                matched_skills = json.dumps(key_skills_match.get('matched', []), ensure_ascii=False)
+                missing_skills = json.dumps(key_skills_match.get('missing', []), ensure_ascii=False)
+                
+                summary = analysis_json.get('summary', '')
+                print(f"Parsowanie JSON udane - ocena: {score}")
+            except json.JSONDecodeError as e:
+                print(f"Nie udało się sparsować JSON: {e}")
+                print(f"Tekst do parsowania: {json_text[:500]}...")
+            
+            # Hash CV dla identyfikacji
+            cv_hash = None
+            if cv_content:
+                cv_hash = hashlib.md5(cv_content.encode('utf-8')).hexdigest()[:16]
+            
+            # Wstawienie do bazy danych
+            cursor.execute('''
+                INSERT INTO CVAnalysisResults 
+                (job_link, creation_date, analysis_content, score, cv_content_hash, 
+                 strengths, weaknesses, matched_skills, missing_skills, summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                job_link,
+                datetime.now().isoformat(),
+                analysis_content,
+                score,
+                cv_hash,
+                strengths,
+                weaknesses,
+                matched_skills,
+                missing_skills,
+                summary
+            ))
+            
+            conn.commit()
+            print(f"Analiza zapisana do bazy danych: {self.analysis_db_path}")
+            
+        except Exception as e:
+            print(f"Błąd podczas zapisywania do bazy danych: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def get_all_analysis_results(self, limit=None):
+        """Pobierz wszystkie wyniki analiz z bazy danych"""
+        try:
+            conn = sqlite3.connect(self.analysis_db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            query = """
+            SELECT * FROM CVAnalysisResults 
+            ORDER BY creation_date DESC
+            """
+            
+            if limit:
+                query += f" LIMIT {limit}"
+            
+            cursor.execute(query)
+            results = cursor.fetchall()
+            return results
+            
+        except Exception as e:
+            print(f"Błąd podczas pobierania wyników analiz: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def get_analysis_by_score_range(self, min_score=None, max_score=None):
+        """Pobierz analizy w określonym zakresie punktów"""
+        try:
+            conn = sqlite3.connect(self.analysis_db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            conditions = []
+            params = []
+            
+            if min_score is not None:
+                conditions.append("score >= ?")
+                params.append(min_score)
+            
+            if max_score is not None:
+                conditions.append("score <= ?")
+                params.append(max_score)
+            
+            where_clause = " AND ".join(conditions) if conditions else "1=1"
+            
+            query = f"""
+            SELECT * FROM CVAnalysisResults 
+            WHERE {where_clause}
+            ORDER BY score DESC, creation_date DESC
+            """
+            
+            cursor.execute(query, params)
+            results = cursor.fetchall()
+            return results
+            
+        except Exception as e:
+            print(f"Błąd podczas pobierania wyników według punktacji: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def get_analysis_statistics(self):
+        """Pobierz statystyki analiz"""
+        try:
+            conn = sqlite3.connect(self.analysis_db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            # Podstawowe statystyki
+            cursor.execute("""
+                SELECT 
+                    COUNT(*) as total_analyses,
+                    AVG(score) as avg_score,
+                    MAX(score) as max_score,
+                    MIN(score) as min_score,
+                    COUNT(DISTINCT cv_content_hash) as unique_cvs
+                FROM CVAnalysisResults 
+                WHERE score IS NOT NULL
+            """)
+            
+            stats = cursor.fetchone()
+            return dict(stats) if stats else {}
+            
+        except Exception as e:
+            print(f"Błąd podczas pobierania statystyk: {e}")
+            return {}
+        finally:
+            if conn:
+                conn.close()
+
+    def print_analysis_summary(self, limit=10):
+        """Wyświetl podsumowanie ostatnich analiz"""
+        results = self.get_all_analysis_results(limit)
+        stats = self.get_analysis_statistics()
+        
+        print(f"\n{'='*80}")
+        print("PODSUMOWANIE ANALIZ CV")
+        print(f"{'='*80}")
+        
+        if stats:
+            total_analyses = stats.get('total_analyses', 0) 
+            avg_score = stats.get('avg_score', 0)
+            max_score = stats.get('max_score', 0)
+            min_score = stats.get('min_score', 0)
+            unique_cvs = stats.get('unique_cvs', 0)
+            
+            print(f"Całkowita liczba analiz: {total_analyses}")
+            if avg_score is not None:
+                print(f"Średnia ocena: {avg_score:.1f}/10")
+            else:
+                print("Średnia ocena: N/A")
+            print(f"Najwyższa ocena: {max_score}/10")
+            print(f"Najniższa ocena: {min_score}/10")  
+            print(f"Liczba różnych CV: {unique_cvs}")
+        else:
+            print("Brak danych statystycznych")
+        
+        print(f"\n{f'OSTATNIE {limit} ANALIZ':<50}")
+        print("-" * 80)
+        
+        for result in results:
+            score_display = f"{result['score']}/10" if result['score'] else "N/A"
+            date_display = result['creation_date'][:16] if result['creation_date'] else "N/A"
+            
+            print(f"Data: {date_display} | Ocena: {score_display:<6} | Link: {result['job_link'][:60]}...")
+        
+        print(f"{'='*80}\n")
+
+    def run(self):
+        """Główna metoda uruchamiająca aplikację"""
+        print("Analizator dopasowania CV do ofert pracy")
+        print("=" * 50)
+        print("Wybierz opcję:")
+        print("1. Analizuj oferty z dzisiejszą datą")
+        print("2. Analizuj oferty z określonego przedziału czasowego")
+        print("3. Pokaż statystyki analiz z bazy danych")
+        print("4. Pokaż najlepsze dopasowania (ocena >= 5)")
+        print("=" * 50)
+        
+        choice = input("Twój wybór (1-4): ").strip()
+        
+        if choice == '1':
+            self.run_today_offers()
+        elif choice == '2':
+            print("Podaj datę początkową (YYYY-MM-DD):")
+            start_date = input().strip()
+            print("Podaj datę końcową (YYYY-MM-DD):")
+            end_date = input().strip()
+            self.run_between_dates_offers(start_date, end_date)
+        elif choice == '3':
+            self.print_analysis_summary()
+        elif choice == '4':
+            self.show_best_matches()
+        else:
+            print("Nieprawidłowy wybór!")
+
+    def show_best_matches(self):
+        """Pokaż najlepiej dopasowane oferty"""
+        results = self.get_analysis_by_score_range(min_score=5)
+        
+        print(f"\n{'='*80}")
+        print("NAJLEPSZE DOPASOWANIA (OCENA >= 5/10)")
+        print(f"{'='*80}")
+        
+        if not results:
+            print("Brak analiz z oceną >= 5/10")
+            return
+        
+        for result in results:
+            print(f"\nOcena: {result['score']}/10")
+            print(f"Data: {result['creation_date'][:16]}")
+            print(f"Link: {result['job_link']}")
+            
+            if result['summary']:
+                print(f"Podsumowanie: {result['summary'][:200]}...")
+            
+            # Pokaż mocne strony jeśli są dostępne
+            if result['strengths']:
+                try:
+                    strengths = json.loads(result['strengths'])
+                    if strengths:
+                        print(f"Mocne strony: {', '.join(strengths[:3])}...")
+                except:
+                    pass
+            
+            print("-" * 40)
+
+    def run_today_offers(self):
+        """Uruchom analizę dla ofert z dzisiejszą datą"""
+        try:
+            # Wczytaj CV z output.txt
+            cv_content = self.read_output_file()
+            if not cv_content:
+                print("Nie znaleziono pliku output.txt z CV!")
+                return
+
+            # Wyświetl linki ofert z dzisiejszą datą
+            link_offers = self.return_job_links()
+
+            if not link_offers:
+                return
+            
+
+            # Przetwórz oferty
+            self.process_offers(link_offers, cv_content)
+
+        except Exception as e:
+            print(f"Błąd: {e}")
+        finally:
+            self.close()
+
+    def check_link_in_database_cv_analysis(self, link):
+        """Sprawdź, czy dany link oferty pracy został już przeanalizowany"""
+        try:
+            conn = sqlite3.connect(self.analysis_db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT * FROM CVAnalysisResults 
+                WHERE job_link = ?
+                ORDER BY creation_date DESC
+                LIMIT 1
+            """, (link,))
+            
+            result = cursor.fetchone()
+            return result is not None
+            
+        except Exception as e:
+            print(f"Błąd podczas sprawdzania linku w bazie danych: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+
+if __name__ == "__main__":
+    analyzer = MainJobAnalyzer()
+    analyzer.run()
