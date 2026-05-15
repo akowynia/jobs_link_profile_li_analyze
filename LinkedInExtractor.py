@@ -175,5 +175,5 @@ class LinkedInExtractor:
 
 if __name__ == "__main__":
     # Przykład użycia
-    extractor = LinkedInExtractor("image.png")
+    extractor = LinkedInExtractor("image.png",model ='deepseek-ocr')
     result = extractor.extract(output_file="output.txt")

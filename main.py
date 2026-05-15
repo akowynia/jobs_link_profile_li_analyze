@@ -1,16 +1,19 @@
 import sqlite3
 import json
 import hashlib
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import cloudscraper
 import bs4
 import ollama
-from analysis_utils import extract_json_from_text
+import os
+import argparse
+from analysis_utils import extract_json_from_text, safe_parse_json
+import time
 
 
 class MainJobAnalyzer:
-    def __init__(self, db_path='discord_bot.db', analysis_db_path='cv_analysis.db', output_file='output.txt', analysis_file=None):
+    def __init__(self, db_path='discord_bot.db', analysis_db_path='cv_analysis.db', output_file='output.txt', analysis_file=None, model_name: str | None = None):
         self.db_path = db_path  # Baza danych dla ofert pracy
         self.analysis_db_path = analysis_db_path  # Osobna baza danych dla analiz CV
         self.output_file = output_file
@@ -31,16 +34,46 @@ class MainJobAnalyzer:
         self.init_analysis_database()
         # MIEJSCE NA INSTRUKCJE 
         self.ollama_instruction = """
-        Porównaj poniższe CV z opisem oferty pracy i oceń dopasowanie kandydata.
-        
-        CV:
-        {cv_content}
-        
-        Oferta pracy:
-        {job_description}
-        
-        Przeanalizuj dopasowanie i przedstaw wynik.
-        """
+Porównaj poniższe CV z opisem oferty pracy.
+
+CV:
+{cv_content}
+
+Oferta pracy:
+{job_description}
+
+Odpowiedz WYŁĄCZNIE jednym obiektem JSON zgodnym z podanym schematem. Nie dodawaj żadnego tekstu, komentarzy, bloków markdown ani wyjaśnień.
+"""
+
+        self.system_prompt = (
+            'Jesteś precyzyjnym asystentem analitycznym. '
+            'Odpowiadasz WYŁĄCZNIE poprawnym, surowym obiektem JSON — bez bloków markdown, '
+            'bez tekstu przed/po, bez komentarzy.\n\n'
+            'Wymagany schemat odpowiedzi:\n'
+            '{\n'
+            '  "score": <int 1-10>,\n'
+            '  "strengths": ["string", ...],\n'
+            '  "weaknesses": ["string", ...],\n'
+            '  "key_skills_match": {\n'
+            '    "matched": ["string", ...],\n'
+            '    "missing": ["string", ...]\n'
+            '  },\n'
+            '  "summary": "string"\n'
+            '}\n\n'
+            'Zasady:\n'
+            '- score: ocena dopasowania 1-10 (liczba całkowita)\n'
+            '- Skup się na konkretach: technologie, doświadczenie, certyfikaty\n'
+            '- Wykryj wymagane języki w ofercie. Jeśli CV nie zawiera wymaganego języka, '
+            'dodaj go do missing i obniż ocenę o 2 pkt za każdy brakujący (min. 1)\n'
+            '- UŻYWAJ POPRAWNEGO JSON: używaj PODWÓJNYCH cudzysłowów (") dla kluczy i wartości tekstowych.\n'
+            '- Zwracaj WSZYSTKIE pola z wzoru. Jeśli nie ma danych, użyj pustych list [] lub pustego stringa "" dla "summary".\n'
+            '- Twoja odpowiedź to WYŁĄCZNIE obiekt JSON, nic więcej'
+        )
+
+        # Model Ollama — można przekazać przez parametr konstruktora, opcję CLI --model
+        # lub zmienną środowiskową OLLAMA_MODEL. Domyślnie: 'ministral-3:8b'.
+        env_model = os.environ.get('OLLAMA_MODEL')
+        self.model_name = model_name or env_model or 'ministral-3:8b'
 
     def process_website(self, website):
         response = ""
@@ -61,8 +94,21 @@ class MainJobAnalyzer:
             print(f"Błąd podczas pobierania strony: {e}")
             return
 
+        html = response.text or ''
+
+        # Jeśli strona to komunikat o konieczności zaktualizowania przeglądarki
+        # lub inny komunikat blokujący (JS, weryfikacja), spróbuj wyrenderować ją
+        # przy pomocy Playwright. Jeśli brak fallbacku, pomiń stronę.
+        if self._is_browser_update_page(html):
+            print(f"[INFO] Strona wygląda na komunikat o aktualizacji przeglądarki — próbuję wyrenderować: {website}")
+            rendered = self._render_with_playwright(website)
+            if not rendered:
+                print(f"[WARN] Nie udało się wyrenderować strony — pomijam: {website}")
+                return
+            html = rendered
+
         # Parsowanie HTML
-        content = bs4.BeautifulSoup(response.text, features="html.parser")
+        content = bs4.BeautifulSoup(html, features="html.parser")
 
         # Usuwanie niepotrzebnych elementów
         for tag in content(['script', 'style', 'nav', 'footer', 'header', 'noscript', 'iframe']):
@@ -74,7 +120,171 @@ class MainJobAnalyzer:
         # Usuwanie nadmiarowych białych znaków
         text_content = ' '.join(text_content.split())
 
+        # Pomijaj bardzo krótkie strony
+        if len(text_content) < 100:
+            print(f"[WARN] Strona zawiera za mało treści: {len(text_content)} znaków — pomijam: {website}")
+            return
+
         return text_content
+
+    def _is_browser_update_page(self, html: str) -> bool:
+        """Heurystyka wykrywająca komunikaty o aktualizacji przeglądarki / blokady JS."""
+        if not html:
+            return False
+
+        lower = html.lower()
+        phrases = (
+            'update your browser',
+            'please update your browser',
+            'upgrade your browser',
+            'browser not supported',
+            'unsupported browser',
+            'please enable javascript',
+            'enable javascript',
+            'please verify you are a human',
+            'verify you are a human',
+            'access denied',
+            'zaktualizuj przegl',
+            'zaktualizuj przeglądarkę',
+            'włącz javascript',
+        )
+
+        for p in phrases:
+            if p in lower:
+                return True
+
+        return False
+
+    def _render_with_playwright(self, url: str, timeout: int = 30000) -> str | None:
+        """Spróbuj wyrenderować stronę przy użyciu Playwright i zwróć HTML.
+
+        Zwraca zawartość HTML lub None jeśli Playwright nie jest dostępny lub
+        renderowanie się nie powiedzie.
+        """
+        try:
+            from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+        except Exception:
+            print("[INFO] Playwright nie jest zainstalowany. Zainstaluj: pip install playwright && playwright install")
+            return None
+
+        UA = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+        )
+
+        def _auto_scroll(page):
+            page.evaluate("""
+                async () => {
+                    const distance = 800;
+                    const delay = (ms) => new Promise(r => setTimeout(r, ms));
+                    for (let i = 0; i < 20; i++) {
+                        window.scrollBy(0, distance);
+                        await delay(300);
+                    }
+                }
+            """)
+
+        attempts = 2
+        for attempt in range(1, attempts + 1):
+            try:
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                    context = browser.new_context(user_agent=UA, viewport={'width': 1280, 'height': 800})
+                    page = context.new_page()
+                    page.goto(url, timeout=timeout, wait_until='domcontentloaded')
+                    try:
+                        _auto_scroll(page)
+                    except Exception:
+                        pass
+                    try:
+                        page.wait_for_load_state('networkidle', timeout=5000)
+                    except Exception:
+                        pass
+                    content = page.content()
+                    text = bs4.BeautifulSoup(content, features="html.parser").get_text(separator=' ', strip=True)
+                    if len(text) < 100:
+                        print(f"[INFO] Playwright render returned too little text ({len(text)} chars) on attempt {attempt}")
+                        browser.close()
+                        if attempt < attempts:
+                            time.sleep(1)
+                            continue
+                        return None
+                    browser.close()
+                    return content
+            except PlaywrightTimeout as e:
+                print(f"[WARN] Playwright timeout on attempt {attempt}: {e}")
+                if attempt == attempts:
+                    return None
+                time.sleep(1)
+                continue
+            except Exception as e:
+                print(f"[WARN] Playwright render failed on attempt {attempt}: {e}")
+                if attempt == attempts:
+                    return None
+                time.sleep(1)
+                continue
+
+    def _is_browser_update_page(self, html: str) -> bool:
+        """Heurystyka wykrywająca komunikaty o aktualizacji przeglądarki / blokady JS."""
+        if not html:
+            return False
+
+        lower = html.lower()
+        phrases = (
+            'update your browser',
+            'please update your browser',
+            'upgrade your browser',
+            'browser not supported',
+            'unsupported browser',
+            'please enable javascript',
+            'enable javascript',
+            'please verify you are a human',
+            'verify you are a human',
+            'access denied',
+            'zaktualizuj przegl',
+            'zaktualizuj przeglądarkę',
+            'włącz javascript',
+        )
+
+        for p in phrases:
+            if p in lower:
+                return True
+
+        return False
+
+    def _get_manual_text_input(self):
+        """Pomocnicza metoda do wczytywania wieloliniowego tekstu od użytkownika."""
+        print("\nWklej treść oferty pracy poniżej.")
+        print("Aby zakończyć, naciśnij Enter dwa razy (pusta linia) lub Ctrl+D.")
+        lines = []
+        while True:
+            try:
+                line = input()
+                if not line and lines and not lines[-1]: # Dwie puste linie
+                    break
+                if not line and not lines: # Pusta linia na początku - czekaj dalej lub wyjdź jeśli chcesz
+                    # Pozwólmy na jedną pustą linię, ale dwie kończą
+                    lines.append(line)
+                    continue
+                if not line: # Pojedyncza pusta linia
+                    lines.append(line)
+                    # Sprawdź czy to już koniec (użytkownik może chcieć zakończyć)
+                    # Ale lepiej czytać do momentu aż faktycznie skończy.
+                    # Zmieńmy logikę: Czytaj aż do pustej linii jeśli coś już jest, 
+                    # albo po prostu poinformuj użytkownika.
+                    print("(Wczytano pustą linię. Naciśnij Enter jeszcze raz, aby zakończyć, lub kontynuuj wklejanie)")
+                    second_line = input()
+                    if not second_line:
+                        break
+                    else:
+                        lines.append(second_line)
+                        continue
+                lines.append(line)
+            except EOFError:
+                break
+        
+        content = "\n".join(lines).strip()
+        return content
 
     def connect_db(self):
         """Połącz z bazą danych"""
@@ -219,7 +429,13 @@ class MainJobAnalyzer:
 
             if not job_description:
                 print(f"Nie udało się pobrać treści oferty: {link}")
-                continue
+                choice = input("Czy chcesz wkleić tekst oferty ręcznie? (t/N): ").strip().lower()
+                if choice == 't':
+                    job_description = self._get_manual_text_input()
+                
+                if not job_description:
+                    print(f"Pomijam ofertę: {link}")
+                    continue
 
             # Analizuj dopasowanie
             print("Analizuję dopasowanie...")
@@ -255,39 +471,106 @@ class MainJobAnalyzer:
         finally:
             self.close()
 
+    @staticmethod
+    def _is_valid_analysis_json(obj) -> bool:
+        """Sprawdza czy obiekt JSON ma wymagany schemat analizy CV."""
+        if not isinstance(obj, dict):
+            return False
+        # wymagane pola i typy
+        if 'score' not in obj or not isinstance(obj.get('score'), int):
+            return False
+        if 'strengths' not in obj or not isinstance(obj.get('strengths'), list):
+            return False
+        if 'weaknesses' not in obj or not isinstance(obj.get('weaknesses'), list):
+            return False
+        ksm = obj.get('key_skills_match')
+        if not isinstance(ksm, dict):
+            return False
+        if 'matched' not in ksm or not isinstance(ksm.get('matched'), list):
+            return False
+        if 'missing' not in ksm or not isinstance(ksm.get('missing'), list):
+            return False
+        if 'summary' not in obj or not isinstance(obj.get('summary'), str):
+            return False
+        return True
+
     def analyze_with_ollama(self, cv_content, job_description):
-        """Analizuj dopasowanie CV do oferty za pomocą Ollama"""
-        try:
-            # Przygotowanie promptu z instrukcją
-            prompt = self.ollama_instruction.format(
-                cv_content=cv_content,
-                job_description=job_description
-            )
+        """Analizuj dopasowanie CV do oferty za pomocą Ollama.
 
-            # Wywołanie Ollama z modelem ministral-3:8b
-            response = ollama.chat(
-                model='ministral-3:8b',
-                messages=[
-                    {
-                        'role': 'system',
-                        'content': 'Masz za zadanie porównać CV z opisem oferty pracy. Twoja odpowiedź musi być wyłącznie poprawnym obiektem JSON. Struktura: {"score": int, "strengths": ["string"], "weaknesses": ["string"], "key_skills_match": {"matched": ["string"], "missing": ["string"]}, "summary": "string"}. Zasady: Oceń dopasowanie 1-10 (liczba całkowita), skup się na konkretach (technologie, staż, certyfikaty), nie dodawaj żadnego tekstu poza obiektem JSON.'
-                        #'content': 'Masz za zadanie porównać CV z opisem oferty pracy i ocenić dopasowanie kandydata. Odpowiedz w sposób zwięzły, ale konkretny, wskazując mocne i słabe strony kandydata względem wymagań oferty. Oceniaj dopasowanie na skali od 1 do 10, gdzie 1 oznacza brak dopasowania, a 10 oznacza idealne dopasowanie. Uwzględnij kluczowe umiejętności, doświadczenie i kwalifikacje wymienione w CV oraz porównaj je z wymaganiami oferty pracy.'
-                    },
-                    {
+        Jeśli otrzymany tekst nie zawiera poprawnego JSON zgodnego ze schematem,
+        spróbuj wykonać analizę ponownie (retry) z informacją o błędzie.
+        Zwraca znormalizowany JSON string lub None jeśli się nie uda."""
 
-                        'role': 'user',
-                        'content': prompt
-                    }
+        prompt = self.ollama_instruction.format(
+            cv_content=cv_content,
+            job_description=job_description
+        )
+
+        max_attempts = 3
+        last_error = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                messages = [
+                    {'role': 'system', 'content': self.system_prompt},
+                    {'role': 'user', 'content': prompt}
                 ]
-            )
 
-            # Wyciągnięcie odpowiedzi
-            analysis_result = response['message']['content']
-            return analysis_result
+                # W retry: dodaj informację o poprzednim błędzie
+                if last_error and attempt > 1:
+                    messages.append({
+                        'role': 'user',
+                        'content': (
+                            f'Poprzednia odpowiedź była niepoprawna: {last_error}. '
+                            f'Odpowiedz WYŁĄCZNIE poprawnym obiektem JSON zgodnym ze schematem.'
+                        )
+                    })
 
-        except Exception as e:
-            print(f"Błąd podczas analizy z Ollama: {e}")
-            return None
+                response = ollama.chat(
+                    model=self.model_name,
+                    messages=messages,
+                    format='json'
+                )
+
+                raw = response['message']['content']
+
+                # Parsowanie z naprawą typowych błędów
+                parsed = safe_parse_json(raw)
+
+                if parsed and self._is_valid_analysis_json(parsed):
+                    if attempt > 1:
+                        print(f"Poprawny JSON otrzymany po {attempt} próbach.")
+                    # Zwróć znormalizowany JSON (nie surową odpowiedź)
+                    return json.dumps(parsed, ensure_ascii=False, indent=2)
+                else:
+                    missing_fields = []
+                    if parsed:
+                        for field in ['score', 'strengths', 'weaknesses', 'key_skills_match', 'summary']:
+                            if field not in parsed:
+                                missing_fields.append(field)
+                    if missing_fields:
+                        parsed_str = json.dumps(parsed, ensure_ascii=False)
+                        last_error = (
+                            f"Brak wymaganych pól: {', '.join(missing_fields)}. "
+                            f"Otrzymany JSON: {parsed_str}. "
+                            "Proszę zwrócić WYŁĄCZNIE kompletny obiekt JSON zgodny ze schematem; "
+                            "jeśli brak danych, ustaw puste listy [] lub pusty string dla 'summary'."
+                        )
+                    else:
+                        last_error = "Odpowiedź nie jest poprawnym obiektem JSON lub brak wymaganej struktury"
+                    print(f"Otrzymany JSON niezgodny ze schematem (próba {attempt}): {last_error}")
+
+            except Exception as e:
+                last_error = str(e)
+                print(f"Błąd podczas analizy z Ollama (próba {attempt}): {e}")
+
+            # Pauza przed kolejną próbą
+            if attempt < max_attempts:
+                time.sleep(1)
+
+        # Wyczerpano próby — NIE zapisuj śmieciowego rekordu
+        print(f"BŁĄD: Po {max_attempts} próbach nie uzyskano poprawnego JSON-a. Rekord nie zostanie zapisany.")
+        return None
 
     def save_analysis(self, content, job_link, cv_content=None):
         """Zapisz analizę do pliku i bazy danych"""
@@ -320,34 +603,23 @@ class MainJobAnalyzer:
             conn = sqlite3.connect(self.analysis_db_path)
             cursor = conn.cursor()
             
-            # Parsowanie JSON z analizy
-            score = None
-            strengths = None
-            weaknesses = None
-            matched_skills = None
-            missing_skills = None
-            summary = None
+            # Parsowanie JSON z analizy (z naprawą typowych błędów)
+            analysis_json = safe_parse_json(analysis_content)
             
-            try:
-                # Wyciągnij JSON z tekstu
-                json_text = self.extract_json_from_text(analysis_content)
-                print(f"Próbuję sparsować JSON: {json_text[:200]}...")
-                
-                # Próba parsowania JSON
-                analysis_json = json.loads(json_text)
-                score = analysis_json.get('score')
-                strengths = json.dumps(analysis_json.get('strengths', []), ensure_ascii=False)
-                weaknesses = json.dumps(analysis_json.get('weaknesses', []), ensure_ascii=False)
-                
-                key_skills_match = analysis_json.get('key_skills_match', {})
-                matched_skills = json.dumps(key_skills_match.get('matched', []), ensure_ascii=False)
-                missing_skills = json.dumps(key_skills_match.get('missing', []), ensure_ascii=False)
-                
-                summary = analysis_json.get('summary', '')
-                print(f"Parsowanie JSON udane - ocena: {score}")
-            except json.JSONDecodeError as e:
-                print(f"Nie udało się sparsować JSON: {e}")
-                print(f"Tekst do parsowania: {json_text[:500]}...")
+            if not analysis_json or not isinstance(analysis_json.get('score'), int):
+                print(f"[WARN] Pomijam zapis do DB — niepoprawny JSON dla: {job_link}")
+                return
+            
+            score = analysis_json.get('score')
+            strengths = json.dumps(analysis_json.get('strengths', []), ensure_ascii=False)
+            weaknesses = json.dumps(analysis_json.get('weaknesses', []), ensure_ascii=False)
+            
+            key_skills_match = analysis_json.get('key_skills_match', {})
+            matched_skills = json.dumps(key_skills_match.get('matched', []), ensure_ascii=False)
+            missing_skills = json.dumps(key_skills_match.get('missing', []), ensure_ascii=False)
+            
+            summary = analysis_json.get('summary', '')
+            print(f"Parsowanie JSON udane - ocena: {score}")
             
             # Hash CV dla identyfikacji
             cv_hash = None
@@ -519,11 +791,14 @@ class MainJobAnalyzer:
         print("Wybierz opcję:")
         print("1. Analizuj oferty z dzisiejszą datą")
         print("2. Analizuj oferty z określonego przedziału czasowego")
-        print("3. Pokaż statystyki analiz z bazy danych")
-        print("4. Pokaż najlepsze dopasowania (ocena >= 5)")
+        print("3. Analizuj oferty z ostatnich X dni")
+        print("4. Pokaż statystyki analiz z bazy danych")
+        print("5. Pokaż najlepsze dopasowania (ocena >= 5)")
+        print("6. Wklej ręcznie link do pojedynczej oferty")
+        print("7. Wklej ręcznie tekst oferty i link")
         print("=" * 50)
         
-        choice = input("Twój wybór (1-4): ").strip()
+        choice = input("Twój wybór (1-7): ").strip()
         
         if choice == '1':
             self.run_today_offers()
@@ -534,11 +809,35 @@ class MainJobAnalyzer:
             end_date = input().strip()
             self.run_between_dates_offers(start_date, end_date)
         elif choice == '3':
-            self.print_analysis_summary()
+            self.run_last_x_days_offers()
         elif choice == '4':
+            self.print_analysis_summary()
+        elif choice == '5':
             self.show_best_matches()
+        elif choice == '6':
+            self.run_single_manual_offer()
+        elif choice == '7':
+            self.run_manual_text_offer()
         else:
             print("Nieprawidłowy wybór!")
+
+    def run_last_x_days_offers(self):
+        """Uruchom analizę dla ofert z ostatnich X dni (włącznie z dzisiaj)."""
+        print("Podaj liczbę dni (np. 7):")
+        days_input = input().strip()
+
+        try:
+            days = int(days_input)
+            if days <= 0:
+                print("Liczba dni musi być większa od 0.")
+                return
+        except ValueError:
+            print("Nieprawidłowa liczba dni. Podaj liczbę całkowitą.")
+            return
+
+        end_date = date.today()
+        start_date = end_date if days == 1 else end_date - timedelta(days=days - 1)
+        self.run_between_dates_offers(start_date.isoformat(), end_date.isoformat())
 
     def show_best_matches(self):
         """Pokaż najlepiej dopasowane oferty"""
@@ -595,6 +894,63 @@ class MainJobAnalyzer:
         finally:
             self.close()
 
+    def run_single_manual_offer(self):
+        """Uruchom analizę dla ręcznie podanego linku"""
+        try:
+            cv_content = self.read_output_file()
+            if not cv_content:
+                print("Nie znaleziono pliku output.txt z CV!")
+                return
+            
+            link = input("Wklej link do oferty pracy: ").strip()
+            if not link.startswith(('http://', 'https://')):
+                print("Niepoprawny format linku.")
+                return
+                
+            if self.check_link_in_database_cv_analysis(link):
+                print(f"OSTRZEŻENIE: Oferta z tego linku była już wcześniej analizowana.")
+            
+            self.process_offers([link], cv_content)
+            
+        except Exception as e:
+            print(f"Błąd: {e}")
+        finally:
+            self.close()
+
+    def run_manual_text_offer(self):
+        """Uruchom analizę dla ręcznie wklejonego tekstu oferty"""
+        try:
+            cv_content = self.read_output_file()
+            if not cv_content:
+                print("Nie znaleziono pliku output.txt z CV!")
+                return
+            
+            link = input("Podaj link do oferty (opcjonalnie, dla bazy danych): ").strip()
+            if not link:
+                link = f"manual_input_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            elif not link.startswith(('http://', 'https://')):
+                print("OSTRZEŻENIE: Link nie zaczyna się od http/https. Zostanie zapisany jako tekst.")
+                
+            job_description = self._get_manual_text_input()
+            
+            if not job_description:
+                print("Nie podano treści oferty. Przerywam.")
+                return
+
+            print("Analizuję dopasowanie...")
+            analysis_result = self.analyze_with_ollama(cv_content, job_description)
+
+            if analysis_result:
+                self.save_analysis(analysis_result, link, cv_content)
+                print("Analiza ukończona!")
+            else:
+                print("Nie udało się przeprowadzić analizy.")
+                
+        except Exception as e:
+            print(f"Błąd: {e}")
+        finally:
+            self.close()
+
     def check_link_in_database_cv_analysis(self, link):
         """Sprawdź, czy dany link oferty pracy został już przeanalizowany"""
         try:
@@ -621,5 +977,9 @@ class MainJobAnalyzer:
 
 
 if __name__ == "__main__":
-    analyzer = MainJobAnalyzer()
+    parser = argparse.ArgumentParser(description='Analizator dopasowania CV do ofert pracy')
+    parser.add_argument('--model', help='Nazwa modelu Ollama (np. ministral-3:8b-cloud)', default=None)
+    args = parser.parse_args()
+
+    analyzer = MainJobAnalyzer(model_name=args.model)
     analyzer.run()
